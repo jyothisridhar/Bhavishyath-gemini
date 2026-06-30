@@ -8,9 +8,11 @@ import os
 import asyncio
 import logging
 import json
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 import google.generativeai as genai
+from flask import Flask, request, Response
 from supabase import create_client, Client
 from telegram import Update
 from telegram.ext import (
@@ -580,8 +582,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# ── Flask App & Webhook ───────────────────────────────────────────────────────
+flask_app = Flask(__name__)
+ptb_app: Application = None
+event_loop: asyncio.AbstractEventLoop = None
+
+
+@flask_app.get("/health")
+def health():
+    return Response("ok", status=200)
+
+
+@flask_app.post("/webhook/<token>")
+def telegram_webhook(token):
+    if token != TELEGRAM_TOKEN:
+        return Response("forbidden", status=403)
+    update = Update.de_json(request.get_json(force=True), ptb_app.bot)
+    asyncio.run_coroutine_threadsafe(
+        ptb_app.process_update(update), event_loop
+    ).result(timeout=30)
+    return Response("ok", status=200)
+
+
+def run_event_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global gemini_model
+    global gemini_model, ptb_app, event_loop
 
     for var, name in [
         (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
@@ -596,24 +626,30 @@ def main():
     init_supabase()
     gemini_model = setup_gemini()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("help",    help_command))
-    app.add_handler(CommandHandler("reset",   reset_command))
-    app.add_handler(CommandHandler("profile", profile_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_error_handler(error_handler)
+    ptb_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    ptb_app.add_handler(CommandHandler("start",   start))
+    ptb_app.add_handler(CommandHandler("help",    help_command))
+    ptb_app.add_handler(CommandHandler("reset",   reset_command))
+    ptb_app.add_handler(CommandHandler("profile", profile_command))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    ptb_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    ptb_app.add_error_handler(error_handler)
 
-    logger.info("Bhavishyat Gemini bot starting on port %s (webhook mode)...", PORT)
+    event_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=run_event_loop, args=(event_loop,), daemon=True)
+    thread.start()
 
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TELEGRAM_TOKEN,
-        webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
-        allowed_updates=Update.ALL_TYPES,
-    )
+    async def setup():
+        await ptb_app.initialize()
+        await ptb_app.start()
+        webhook_endpoint = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
+        await ptb_app.bot.set_webhook(webhook_endpoint)
+        logger.info("Webhook registered: %s", webhook_endpoint)
+
+    asyncio.run_coroutine_threadsafe(setup(), event_loop).result(timeout=30)
+
+    logger.info("Bhavishyat Gemini bot starting on port %s...", PORT)
+    flask_app.run(host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
