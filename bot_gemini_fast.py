@@ -212,6 +212,34 @@ def count_session_turns(user_id: int) -> int:
         logger.error("count_session_turns error: %s", e)
         return 0
 
+def get_knowledge_base_context(query_text: str, max_results: int = 5) -> str:
+    """
+    Search the knowledge_base table for entries relevant to the student's
+    message. Returns a formatted context block, or "" if nothing relevant
+    is found.
+    """
+    try:
+        res = supabase.rpc(
+            "search_knowledge_base",
+            {"query_text": query_text, "max_results": max_results}
+        ).execute()
+        rows = res.data or []
+        if not rows:
+            return ""
+
+        parts = [
+            "[VERIFIED KNOWLEDGE BASE — Bhavishyath's own NGO resources. "
+            "Treat the facts below as authoritative for any college names, "
+            "scholarship details, or course/exam specifics they cover.]"
+        ]
+        for row in rows:
+            parts.append(
+                f"- {row['title']} ({row['category']}, {row['district']}): {row['content']}"
+            )
+        return "\n".join(parts)
+    except Exception as e:
+        logger.error("Knowledge base search error: %s", e)
+        return ""
 
 # ── Gemini Setup ──────────────────────────────────────────────────────────────
 def setup_gemini():
@@ -251,7 +279,10 @@ async def get_gemini_response(user_id: int, user_message: str) -> str:
     try:
         history = get_session_history(user_id)
         context = build_context_message(user_id)
-        augmented_message = f"{context}\n\n{user_message}" if (context and not history) else user_message
+        kb_context = get_knowledge_base_context(user_message)   # NEW — runs every turn
+
+        pieces = [p for p in [kb_context, context if not history else ""] if p]
+        augmented_message = "\n\n".join(pieces + [user_message]) if pieces else user_message
 
         chat = gemini_model.start_chat(history=history)
         response = chat.send_message(augmented_message)
@@ -263,7 +294,6 @@ async def get_gemini_response(user_id: int, user_message: str) -> str:
             "Sorry, I'm having a bit of trouble right now. Please try again in a moment. "
             "If this keeps happening, contact the Bhavishyat team."
         )
-
 
 # ── Crisis Detection ──────────────────────────────────────────────────────────
 CRISIS_KEYWORDS = [
