@@ -1,5 +1,5 @@
 """
-Bhavishyat Career Counselling Bot - Telegram MVP
+Bhavishyath Career Counselling Bot - Telegram MVP
 Powered by Google Gemini 3 Flash + Supabase
 Performance-optimised: background logging + async profile extraction
 """
@@ -270,7 +270,7 @@ async def get_gemini_response(user_id: int, user_message: str) -> str:
         logger.error("Gemini API error for user %s: %s", user_id, e)
         return (
             "Sorry, I'm having a bit of trouble right now. Please try again in a moment. "
-            "If this keeps happening, contact the Bhavishyat team."
+            "If this keeps happening, contact the Bhavishyath team."
         )
 
 # ── Crisis Detection ──────────────────────────────────────────────────────────
@@ -340,7 +340,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         greeting = (
             f"Namaste {user.first_name}! 👋\n\n"
-            "I'm *Bhavishyat*, your career counsellor. I'm here to help you think through "
+            "I'm *Bhavishyath*, your career counsellor. I'm here to help you think through "
             "your education and career options — whether you're in school, intermediate, or degree.\n\n"
             "To get started, could you tell me:\n"
             "• Which class/year are you in?\n"
@@ -353,11 +353,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "*Bhavishyat Career Counsellor* 🎓\n\n"
+        "*Bhavishyath Career Counsellor* 🎓\n\n"
         "I can help you with:\n"
         "• Career paths after 10th, Intermediate, or Degree\n"
         "• Entrance exams: EAMCET, NEET, JEE, POLYCET, ICET\n"
-        "• College options in Andhra Pradesh\n"
+        "• College options in your state\n"
         "• Scholarships and government schemes\n"
         "• Polytechnic and ITI courses\n\n"
         "*Commands:*\n"
@@ -627,7 +627,7 @@ def main():
 
     asyncio.run_coroutine_threadsafe(setup(), event_loop).result(timeout=30)
 
-    logger.info("Bhavishyat Gemini bot starting on port %s...", PORT)
+    logger.info("Bhavishyath Gemini bot starting on port %s...", PORT)
     flask_app.run(host="0.0.0.0", port=PORT)
 
 
