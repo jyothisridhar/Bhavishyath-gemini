@@ -10,8 +10,10 @@ import logging
 import json
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from dotenv import load_dotenv
 import google.generativeai as genai
 from flask import Flask, request, Response
@@ -46,6 +48,12 @@ MODEL_NAME        = "gemini-3-flash-preview"
 MAX_HISTORY_TURNS = 10
 PROFILE_EXTRACT_EVERY = 2   # student messages between profile extractions
 THREAD_POOL_SIZE  = 32      # blocking DB/model calls run here, off the event loop
+GEMINI_ATTEMPTS   = 2       # one try plus one retry
+GEMINI_TIMEOUT    = 20      # seconds allowed for each attempt
+GEMINI_RETRY_WAIT = 1       # seconds between attempts
+SLOW_REPLY_SECONDS = 10     # send a "still working" note if no reply by then
+SLOW_REPLY_NOTICE = "Still working on it, one moment."
+RECENT_UPDATES_CAP = 1000   # Telegram update ids remembered to drop redeliveries
 BOT_NAME         = "gemini"   # discriminator — keeps sessions isolated in shared Supabase
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
@@ -299,8 +307,21 @@ async def get_gemini_response(user_id: int, user_message: str) -> str:
         pieces = [p for p in [kb_context, context] if p]
         augmented_message = "\n\n".join(pieces + [user_message]) if pieces else user_message
 
-        chat = gemini_model.start_chat(history=history)
-        response = await timed("gemini", chat.send_message, augmented_message)
+        for attempt in range(1, GEMINI_ATTEMPTS + 1):
+            try:
+                # Fresh chat per attempt, so a failed call can't leave half a turn behind
+                chat = gemini_model.start_chat(history=history)
+                response = await timed("gemini", partial(
+                    chat.send_message, augmented_message,
+                    request_options={"timeout": GEMINI_TIMEOUT},
+                ))
+                break
+            except Exception as e:
+                if attempt == GEMINI_ATTEMPTS:
+                    raise
+                logger.warning("Gemini attempt %s/%s failed for user %s: %s",
+                               attempt, GEMINI_ATTEMPTS, user_id, e)
+                await asyncio.sleep(GEMINI_RETRY_WAIT)
         return response.text
 
     except Exception as e:
@@ -354,6 +375,16 @@ async def send_long_message(update: Update, text: str):
 
     for part in parts:
         await update.message.reply_text(part)
+
+
+async def send_slow_notice(update: Update):
+    """Start this as a task and cancel it when the reply is ready. It only
+    sends if the reply takes longer than SLOW_REPLY_SECONDS."""
+    await asyncio.sleep(SLOW_REPLY_SECONDS)
+    try:
+        await update.message.reply_text(SLOW_REPLY_NOTICE)
+    except Exception as e:
+        logger.warning("Could not send slow-reply notice: %s", e)
 
 
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
@@ -464,7 +495,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # These must be sequential — history must be saved before AI call,
     # and AI response must be saved before next message
     await timed("save_user", save_to_session_history, user.id, "user", user_message)
-    bot_response = await get_gemini_response(user.id, user_message)
+    notice = asyncio.create_task(send_slow_notice(update))
+    try:
+        bot_response = await get_gemini_response(user.id, user_message)
+    finally:
+        notice.cancel()
 
     # Send the reply first, then save it. The handler still finishes only after
     # the save, so the next message sees the full history.
@@ -493,6 +528,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("Voice message from %s (%s)", user.id, user.username)
     t0 = time.perf_counter()
+    notice = asyncio.create_task(send_slow_notice(update))
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
@@ -545,6 +581,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await timed("save_user", save_to_session_history, user.id, "user", transcribed_text)
         bot_response = await get_gemini_response(user.id, transcribed_text)
+        notice.cancel()
 
         try:
             await send_long_message(update, bot_response)
@@ -565,6 +602,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Sorry, I had trouble processing that voice message. "
             "Could you try again or type your question? 😊"
         )
+    finally:
+        notice.cancel()
 
 
 async def update_profile_from_conversation(user_id: int, username: str, first_name: str):
@@ -625,14 +664,39 @@ def health():
     return Response("ok", status=200)
 
 
+_recent_updates: OrderedDict = OrderedDict()
+_recent_updates_lock = threading.Lock()
+
+
+def is_duplicate_update(update_id: int) -> bool:
+    """True if Telegram has already delivered this update (it redelivers when it
+    doesn't get a quick 200). Remembers the last RECENT_UPDATES_CAP ids."""
+    with _recent_updates_lock:
+        if update_id in _recent_updates:
+            return True
+        _recent_updates[update_id] = None
+        if len(_recent_updates) > RECENT_UPDATES_CAP:
+            _recent_updates.popitem(last=False)
+        return False
+
+
+def log_update_failure(future):
+    if not future.cancelled() and future.exception():
+        logger.error("Update processing failed: %s", future.exception())
+
+
 @flask_app.post("/webhook/<token>")
 def telegram_webhook(token):
     if token != TELEGRAM_TOKEN:
         return Response("forbidden", status=403)
     update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-    asyncio.run_coroutine_threadsafe(
-        ptb_app.process_update(update), event_loop
-    ).result(timeout=30)
+    if is_duplicate_update(update.update_id):
+        logger.info("Ignoring duplicate update %s", update.update_id)
+        return Response("ok", status=200)
+    # Reply 200 straight away and handle the update in the background. Waiting
+    # for the answer made Telegram retry after its timeout, giving duplicate replies.
+    future = asyncio.run_coroutine_threadsafe(ptb_app.process_update(update), event_loop)
+    future.add_done_callback(log_update_failure)
     return Response("ok", status=200)
 
 
@@ -642,8 +706,14 @@ def run_event_loop(loop: asyncio.AbstractEventLoop):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    global gemini_model, ptb_app, event_loop
+_initialised = False
+
+
+def init_app():
+    """Set up Supabase, Gemini, the Telegram app and the webhook. Safe to call twice."""
+    global gemini_model, ptb_app, event_loop, _initialised
+    if _initialised:
+        return
 
     for var, name in [
         (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
@@ -682,7 +752,18 @@ def main():
         logger.info("Webhook registered: %s", webhook_endpoint)
 
     asyncio.run_coroutine_threadsafe(setup(), event_loop).result(timeout=30)
+    _initialised = True
 
+
+def create_app():
+    """Entry point for gunicorn: bot_gemini_fast:create_app()"""
+    init_app()
+    return flask_app
+
+
+def main():
+    """Local run with Flask's development server. Production uses gunicorn."""
+    init_app()
     logger.info("Bhavishyath Gemini bot starting on port %s...", PORT)
     flask_app.run(host="0.0.0.0", port=PORT)
 

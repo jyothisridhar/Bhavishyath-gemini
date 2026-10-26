@@ -10,4 +10,6 @@ COPY prompt.txt .
 
 EXPOSE 8080
 
-CMD ["python", "bot_gemini_fast.py"]
+# One worker: the bot keeps its own event loop and dedupe cache in memory.
+# Threads handle the webhook requests, which now return immediately.
+CMD exec gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 1 --threads 8 --timeout 60 "bot_gemini_fast:create_app()"
