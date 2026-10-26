@@ -9,6 +9,8 @@ import asyncio
 import logging
 import json
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -42,7 +44,9 @@ WEBHOOK_URL       = os.getenv("WEBHOOK_URL")       # Cloud Run service URL
 PORT              = int(os.getenv("PORT", "8080")) # Cloud Run sets this automatically
 MODEL_NAME        = "gemini-3-flash-preview"
 MAX_HISTORY_TURNS = 10
-BOT_NAME          = "gemini"   # discriminator — keeps sessions isolated in shared Supabase
+PROFILE_EXTRACT_EVERY = 2   # student messages between profile extractions
+THREAD_POOL_SIZE  = 32      # blocking DB/model calls run here, off the event loop
+BOT_NAME         = "gemini"   # discriminator — keeps sessions isolated in shared Supabase
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 _prompt_path = os.path.join(os.path.dirname(__file__), "prompt.txt")
@@ -176,18 +180,24 @@ def clear_session_history(user_id: int):
         logger.error("clear_session_history error: %s", e)
 
 
-def count_session_turns(user_id: int) -> int:
+def count_user_messages(user_id: int) -> int:
+    """
+    Lifetime count of the student's messages. Read from conversation_log, not
+    session_history, because session_history is pruned to 30 rows and its
+    row count stops changing once it reaches the cap.
+    """
     try:
         res = (
-            supabase.table("session_history")
+            supabase.table("conversation_log")
             .select("id", count="exact")
             .eq("user_id", user_id)
             .eq("bot", BOT_NAME)
+            .eq("role", "user")
             .execute()
         )
         return res.count or 0
     except Exception as e:
-        logger.error("count_session_turns error: %s", e)
+        logger.error("count_user_messages error: %s", e)
         return 0
 
 def get_knowledge_base_context(query_text: str, max_results: int = 5) -> str:
@@ -219,6 +229,17 @@ def get_knowledge_base_context(query_text: str, max_results: int = 5) -> str:
         logger.error("Knowledge base search error: %s", e)
         return ""
 
+# ── Blocking-call helper ──────────────────────────────────────────────────────
+async def timed(label: str, fn, *args):
+    """Run a blocking call in the thread pool so it never stalls the event loop,
+    and log how long it took (labels only, no student text)."""
+    start = time.perf_counter()
+    try:
+        return await asyncio.to_thread(fn, *args)
+    finally:
+        logger.info("timing %s: %.0f ms", label, (time.perf_counter() - start) * 1000)
+
+
 # ── Gemini Setup ──────────────────────────────────────────────────────────────
 def setup_gemini():
     genai.configure(api_key=GEMINI_API_KEY)
@@ -246,8 +267,16 @@ gemini_model = None
 def build_context_message(user_id: int) -> str:
     memory = get_user_memory(user_id)
     parts = []
-    if memory["profile"]:
-        parts.append(f"[Student profile: {json.dumps(memory['profile'])}]")
+    known = {k: v for k, v in memory["profile"].items() if v not in (None, "", [], {})}
+    if known:
+        fields = "; ".join(
+            f"{k.replace('_', ' ')}: {', '.join(map(str, v)) if isinstance(v, list) else v}"
+            for k, v in known.items()
+        )
+        parts.append(
+            "[Already known about this student — do not ask for these again, use them naturally, "
+            f"and re-ask only if the student contradicts them: {fields}]"
+        )
     if memory["summary"]:
         parts.append(f"[Previous sessions summary: {memory['summary']}]")
     return "\n".join(parts)
@@ -255,15 +284,23 @@ def build_context_message(user_id: int) -> str:
 
 async def get_gemini_response(user_id: int, user_message: str) -> str:
     try:
-        history = get_session_history(user_id)
-        context = build_context_message(user_id)
-        kb_context = get_knowledge_base_context(user_message)   # NEW — runs every turn
+        # The three reads are independent, so run them at the same time
+        history, context, kb_context = await asyncio.gather(
+            timed("history", get_session_history, user_id),
+            timed("memory", build_context_message, user_id),
+            timed("knowledge_base", get_knowledge_base_context, user_message),
+        )
 
-        pieces = [p for p in [kb_context, context if not history else ""] if p]
+        # The caller saves the student's message before this runs, so history already
+        # ends with it. Drop it here, since send_message sends it as the new turn.
+        if history and history[-1]["role"] == "user" and history[-1]["parts"] == [user_message]:
+            history = history[:-1]
+
+        pieces = [p for p in [kb_context, context] if p]
         augmented_message = "\n\n".join(pieces + [user_message]) if pieces else user_message
 
         chat = gemini_model.start_chat(history=history)
-        response = chat.send_message(augmented_message)
+        response = await timed("gemini", chat.send_message, augmented_message)
         return response.text
 
     except Exception as e:
@@ -324,11 +361,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("User %s (%s) started the bot", user.id, user.username)
 
-    memory = get_user_memory(user.id)
+    memory = await asyncio.to_thread(get_user_memory, user.id)
     is_returning = bool(memory["profile"] or memory["summary"])
 
     if not is_returning:
-        update_user_memory(user.id, user.username or "", user.first_name, {}, "")
+        await asyncio.to_thread(
+            update_user_memory, user.id, user.username or "", user.first_name, {}, ""
+        )
 
     if is_returning:
         name = memory["profile"].get("name", user.first_name)
@@ -372,7 +411,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    clear_session_history(user.id)
+    await asyncio.to_thread(clear_session_history, user.id)
     await update.message.reply_text(
         "Conversation cleared! 🔄 I still remember your profile from before.\n\nWhat would you like to talk about?",
         parse_mode="Markdown"
@@ -381,7 +420,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    memory = get_user_memory(user.id)
+    memory = await asyncio.to_thread(get_user_memory, user.id)
 
     if not memory["profile"] and not memory["summary"]:
         await update.message.reply_text(
@@ -403,6 +442,7 @@ async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_message = update.message.text
+    t0 = time.perf_counter()
 
     logger.info("Message from %s (%s): %s", user.id, user.username, user_message[:100])
 
@@ -423,12 +463,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # These must be sequential — history must be saved before AI call,
     # and AI response must be saved before next message
-    save_to_session_history(user.id, "user", user_message)
+    await timed("save_user", save_to_session_history, user.id, "user", user_message)
     bot_response = await get_gemini_response(user.id, user_message)
-    save_to_session_history(user.id, "model", bot_response)
 
-    # Send reply immediately — student gets response without waiting for logging
-    await send_long_message(update, bot_response)
+    # Send the reply first, then save it. The handler still finishes only after
+    # the save, so the next message sees the full history.
+    try:
+        await send_long_message(update, bot_response)
+        logger.info("Reply sent to %s in %.0f ms", user.id, (time.perf_counter() - t0) * 1000)
+    finally:
+        await timed("save_model", save_to_session_history, user.id, "model", bot_response)
 
     # Fire-and-forget: log bot response + extract profile in background
     asyncio.create_task(
@@ -448,6 +492,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     user = update.effective_user
     logger.info("Voice message from %s (%s)", user.id, user.username)
+    t0 = time.perf_counter()
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
@@ -457,7 +502,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audio_bytes = bytes(await tg_file.download_as_bytearray())
 
         transcribe_model = genai.GenerativeModel(model_name=MODEL_NAME)
-        transcription_result = transcribe_model.generate_content([
+        transcription_result = await timed("transcribe", transcribe_model.generate_content, [
             {
                 "inline_data": {
                     "mime_type": "audio/ogg",
@@ -498,11 +543,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(CRISIS_RESPONSE, parse_mode="Markdown")
             return
 
-        save_to_session_history(user.id, "user", transcribed_text)
+        await timed("save_user", save_to_session_history, user.id, "user", transcribed_text)
         bot_response = await get_gemini_response(user.id, transcribed_text)
-        save_to_session_history(user.id, "model", bot_response)
 
-        await send_long_message(update, bot_response)
+        try:
+            await send_long_message(update, bot_response)
+            logger.info("Voice reply sent to %s in %.0f ms", user.id, (time.perf_counter() - t0) * 1000)
+        finally:
+            await timed("save_model", save_to_session_history, user.id, "model", bot_response)
 
         asyncio.create_task(
             asyncio.to_thread(log_message_bg, user.id, user.username or "", "assistant", bot_response)
@@ -520,9 +568,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def update_profile_from_conversation(user_id: int, username: str, first_name: str):
-    """Lightweight Gemini call to extract profile facts every 4 turns."""
-    turn_count = count_session_turns(user_id)
-    if turn_count % 4 != 0:
+    """Runs the blocking extraction in a worker thread so it never stalls other students."""
+    await asyncio.to_thread(extract_profile_sync, user_id, username, first_name)
+
+
+def extract_profile_sync(user_id: int, username: str, first_name: str):
+    """Lightweight Gemini call to extract profile facts every few student messages."""
+    message_count = count_user_messages(user_id)
+    if message_count == 0 or message_count % PROFILE_EXTRACT_EVERY != 0:
         return
 
     try:
@@ -615,6 +668,9 @@ def main():
     ptb_app.add_error_handler(error_handler)
 
     event_loop = asyncio.new_event_loop()
+    # The default pool is only a few threads on a small Cloud Run instance, which
+    # a handful of concurrent Gemini calls would fill.
+    event_loop.set_default_executor(ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE))
     thread = threading.Thread(target=run_event_loop, args=(event_loop,), daemon=True)
     thread.start()
 
