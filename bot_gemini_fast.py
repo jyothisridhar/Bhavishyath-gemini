@@ -6,6 +6,7 @@ Performance-optimised: background logging + async profile extraction
 
 import os
 import asyncio
+import hmac
 import logging
 import json
 import threading
@@ -36,6 +37,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+# The HTTP client logs every request URL at INFO, and Telegram API URLs contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
@@ -43,6 +47,7 @@ GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_KEY")
 WEBHOOK_URL       = os.getenv("WEBHOOK_URL")       # Cloud Run service URL
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")    # sent by Telegram in a header; A-Z a-z 0-9 _ - only
 PORT              = int(os.getenv("PORT", "8080")) # Cloud Run sets this automatically
 MODEL_NAME        = "gemini-3-flash-preview"
 MAX_HISTORY_TURNS = 10
@@ -390,7 +395,7 @@ async def send_slow_notice(update: Update):
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info("User %s (%s) started the bot", user.id, user.username)
+    logger.info("User %s started the bot", user.id)
 
     memory = await asyncio.to_thread(get_user_memory, user.id)
     is_returning = bool(memory["profile"] or memory["summary"])
@@ -475,7 +480,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     t0 = time.perf_counter()
 
-    logger.info("Message from %s (%s): %s", user.id, user.username, user_message[:100])
+    logger.info("Message from %s (%d chars)", user.id, len(user_message))
 
     # Fire-and-forget: log incoming message without waiting
     asyncio.create_task(
@@ -526,7 +531,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     3. Feed transcription into normal conversation flow
     """
     user = update.effective_user
-    logger.info("Voice message from %s (%s)", user.id, user.username)
+    logger.info("Voice message from %s", user.id)
     t0 = time.perf_counter()
     notice = asyncio.create_task(send_slow_notice(update))
 
@@ -560,7 +565,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        logger.info("Voice transcribed for user %s: %s", user.id, transcribed_text[:100])
+        logger.info("Voice transcribed for user %s (%d chars)", user.id, len(transcribed_text))
 
         await update.message.reply_text(
             f"🎤 _I heard:_ \"{transcribed_text}\"",
@@ -642,14 +647,16 @@ If you cannot infer a field, omit it. Return only valid JSON."""
         memory = get_user_memory(user_id)
         merged = {**memory["profile"], **new_profile}
         update_user_memory(user_id, username, first_name, merged, memory["summary"])
-        logger.info("Updated profile for user %s: %s", user_id, merged)
+        logger.info("Updated profile for user %s (fields: %s)", user_id, ", ".join(sorted(merged)))
 
     except Exception as e:
         logger.debug("Profile extraction skipped: %s", e)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Update %s caused error: %s", update, context.error)
+    # Log the update id only; the full update holds the student's message text
+    update_id = getattr(update, "update_id", None)
+    logger.error("Update %s caused error: %s", update_id, context.error)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -685,9 +692,11 @@ def log_update_failure(future):
         logger.error("Update processing failed: %s", future.exception())
 
 
-@flask_app.post("/webhook/<token>")
-def telegram_webhook(token):
-    if token != TELEGRAM_TOKEN:
+@flask_app.post("/webhook")
+def telegram_webhook():
+    # Telegram sends the secret we gave set_webhook in this header on every call
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(secret.encode(), WEBHOOK_SECRET.encode()):
         return Response("forbidden", status=403)
     update = Update.de_json(request.get_json(force=True), ptb_app.bot)
     if is_duplicate_update(update.update_id):
@@ -721,6 +730,7 @@ def init_app():
         (SUPABASE_URL,   "SUPABASE_URL"),
         (SUPABASE_KEY,   "SUPABASE_KEY"),
         (WEBHOOK_URL,    "WEBHOOK_URL"),
+        (WEBHOOK_SECRET, "WEBHOOK_SECRET"),
     ]:
         if not var:
             raise ValueError(f"{name} not set in environment variables")
@@ -747,8 +757,8 @@ def init_app():
     async def setup():
         await ptb_app.initialize()
         await ptb_app.start()
-        webhook_endpoint = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
-        await ptb_app.bot.set_webhook(webhook_endpoint)
+        webhook_endpoint = f"{WEBHOOK_URL}/webhook"
+        await ptb_app.bot.set_webhook(webhook_endpoint, secret_token=WEBHOOK_SECRET)
         logger.info("Webhook registered: %s", webhook_endpoint)
 
     asyncio.run_coroutine_threadsafe(setup(), event_loop).result(timeout=30)
