@@ -59,6 +59,7 @@ GEMINI_RETRY_WAIT = 1       # seconds between attempts
 SLOW_REPLY_SECONDS = 10     # send a "still working" note if no reply by then
 SLOW_REPLY_NOTICE = "Still working on it, one moment."
 RECENT_UPDATES_CAP = 1000   # Telegram update ids remembered to drop redeliveries
+WEBHOOK_WAIT_SECONDS = 25   # hold the webhook open this long; Cloud Run only gives CPU during a request
 BOT_NAME         = "gemini"   # discriminator — keeps sessions isolated in shared Supabase
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
@@ -73,13 +74,28 @@ except FileNotFoundError:
 
 
 # ── Supabase Client ───────────────────────────────────────────────────────────
+class _PerThreadClient:
+    """One Supabase client per thread. A single client shared by the worker threads
+    failed under concurrent calls ("deque mutated during iteration"), which silently
+    dropped the chat history for that message."""
+    def __init__(self):
+        self._local = threading.local()
+
+    def __getattr__(self, name):
+        client = getattr(self._local, "client", None)
+        if client is None:
+            client = self._local.client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        return getattr(client, name)
+
+
 supabase: Client = None
 
 def init_supabase():
     global supabase
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    create_client(SUPABASE_URL, SUPABASE_KEY)   # fail at startup if the credentials are wrong
+    supabase = _PerThreadClient()
     logger.info("Supabase client initialised")
 
 
@@ -514,12 +530,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await timed("save_model", save_to_session_history, user.id, "model", bot_response)
 
-    # Fire-and-forget: log bot response + extract profile in background
-    asyncio.create_task(
-        asyncio.to_thread(log_message_bg, user.id, user.username or "", "assistant", bot_response)
-    )
-    asyncio.create_task(
-        update_profile_from_conversation(user.id, user.username or "", user.first_name)
+    # The reply is already sent. Finish the logging and profile update before the
+    # handler returns, so they run while the webhook request still holds the CPU.
+    await asyncio.gather(
+        asyncio.to_thread(log_message_bg, user.id, user.username or "", "assistant", bot_response),
+        update_profile_from_conversation(user.id, user.username or "", user.first_name),
     )
 
 
@@ -594,11 +609,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             await timed("save_model", save_to_session_history, user.id, "model", bot_response)
 
-        asyncio.create_task(
-            asyncio.to_thread(log_message_bg, user.id, user.username or "", "assistant", bot_response)
-        )
-        asyncio.create_task(
-            update_profile_from_conversation(user.id, user.username or "", user.first_name)
+        await asyncio.gather(
+            asyncio.to_thread(log_message_bg, user.id, user.username or "", "assistant", bot_response),
+            update_profile_from_conversation(user.id, user.username or "", user.first_name),
         )
 
     except Exception as e:
@@ -702,10 +715,16 @@ def telegram_webhook():
     if is_duplicate_update(update.update_id):
         logger.info("Ignoring duplicate update %s", update.update_id)
         return Response("ok", status=200)
-    # Reply 200 straight away and handle the update in the background. Waiting
-    # for the answer made Telegram retry after its timeout, giving duplicate replies.
     future = asyncio.run_coroutine_threadsafe(ptb_app.process_update(update), event_loop)
     future.add_done_callback(log_update_failure)
+    # Keep this request open while the update is handled. Once a Cloud Run request
+    # returns, the container's CPU is throttled and any work still running crawls.
+    # If it takes longer than WEBHOOK_WAIT_SECONDS, answer 200 anyway (processing
+    # carries on) so Telegram doesn't time out and redeliver.
+    try:
+        future.result(timeout=WEBHOOK_WAIT_SECONDS)
+    except Exception:
+        pass  # a timeout is expected for slow replies; real failures are logged by the callback
     return Response("ok", status=200)
 
 

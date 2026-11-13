@@ -11,5 +11,6 @@ COPY prompt.txt .
 EXPOSE 8080
 
 # One worker: the bot keeps its own event loop and dedupe cache in memory.
-# Threads handle the webhook requests, which now return immediately.
-CMD exec gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 1 --threads 8 --timeout 60 "bot_gemini_fast:create_app()"
+# Each webhook request is held open until its reply is sent (see WEBHOOK_WAIT_SECONDS),
+# so give it enough threads for the students chatting at once.
+CMD exec gunicorn --bind "0.0.0.0:${PORT:-8080}" --workers 1 --threads 32 --timeout 60 "bot_gemini_fast:create_app()"
