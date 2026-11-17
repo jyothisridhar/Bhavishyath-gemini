@@ -8,6 +8,8 @@ The Telugu text is a first draft. A Telugu speaker must check it, and the
 Bhavishyath team must approve the consent wording, before launch.
 """
 
+import re
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 CONSENT_VERSION = "v1"
@@ -120,9 +122,36 @@ TEXT = {
         "What should I call you? Type your name, or tap the button.",
         "మిమ్మల్ని ఏమని పిలవాలి? మీ పేరు టైప్ చేయండి, లేదా బటన్ నొక్కండి.",
     ),
-    "done": (
-        "Thanks, {name}. What is on your mind today?",
-        "ధన్యవాదాలు, {name}. ఈ రోజు మీ మనసులో ఏముంది?",
+    # First question after intake, matched to the student's class (see opening())
+    "opening_class10": (
+        "Thanks, {name}. After 10th there is a big choice to make, like which group or course "
+        "to take. Is that what you are thinking about, or something else?",
+        "ధన్యవాదాలు, {name}. 10వ తరగతి తర్వాత ఏ గ్రూప్ లేదా కోర్సు తీసుకోవాలి అనే పెద్ద నిర్ణయం ఉంటుంది. "
+        "మీరు దాని గురించి ఆలోచిస్తున్నారా, లేక వేరే ఏదైనానా?",
+    ),
+    "opening_school": (
+        "Thanks, {name}. What would you like help with first: choosing subjects, finding out "
+        "about careers, or something else? You can also say you are not sure yet.",
+        "ధన్యవాదాలు, {name}. మొదట దేని గురించి సహాయం కావాలి: సబ్జెక్టులు ఎంచుకోవడం, కెరీర్ల గురించి "
+        "తెలుసుకోవడం, లేక వేరే ఏదైనా? ఇంకా తెలియదు అని కూడా చెప్పవచ్చు.",
+    ),
+    "opening_inter": (
+        "Thanks, {name}. Inter is when a lot of decisions start to come up. Which one is on your "
+        "mind most: what to study next, an entrance exam, or a college? Or maybe you are not sure yet.",
+        "ధన్యవాదాలు, {name}. ఇంటర్‌లో చాలా నిర్ణయాలు మొదలవుతాయి. మీ మనసులో ఏది ఎక్కువగా ఉంది: "
+        "తర్వాత ఏం చదవాలి, ఎంట్రన్స్ పరీక్ష, లేక కాలేజీ? లేదా ఇంకా తెలియదా?",
+    ),
+    "opening_degree": (
+        "Thanks, {name}. Are you thinking more about getting a job, studying further, or an exam? "
+        "Or something else?",
+        "ధన్యవాదాలు, {name}. మీరు ఉద్యోగం గురించి, ఇంకా చదవడం గురించి, లేక పరీక్ష గురించి "
+        "ఆలోచిస్తున్నారా? లేక వేరే ఏదైనానా?",
+    ),
+    "opening_other": (
+        "Thanks, {name}. What would you like help with first: a course, an exam, a college, "
+        "or you are not sure where to start?",
+        "ధన్యవాదాలు, {name}. మొదట దేని గురించి సహాయం కావాలి: కోర్సు, పరీక్ష, కాలేజీ, "
+        "లేక ఎక్కడ మొదలుపెట్టాలో తెలియదా?",
     ),
     "welcome_back": (
         "Welcome back, {name}. What would you like to explore today?",
@@ -193,6 +222,26 @@ def next_step(fields):
     if not fields.get("name"):
         return "name"
     return None
+
+
+def opening_key(class_year):
+    """Which opening question suits this class. Also reads the free-text values that
+    pilot students have in profile_json ("10th grade", "Inter 2nd year", ...)."""
+    s = (class_year or "").lower()
+    if "inter" in s:
+        return "opening_inter"
+    if "degree" in s:
+        return "opening_degree"
+    if re.search(r"\b10(th)?\b|tenth", s):
+        return "opening_class10"
+    if re.search(r"\b[89](th)?\b|eighth|ninth", s):
+        return "opening_school"
+    return "opening_other"
+
+
+def opening(fields, lang, name):
+    """The first question after intake, matched to the student's class."""
+    return text(opening_key(fields.get("class_year")), lang, name=name)
 
 
 def prompt(step, lang):

@@ -488,7 +488,7 @@ async def advance_intake(bot, user, memory: dict, step: str, value: str):
         await send_step(bot, user.id, nxt, lang, user.first_name)
     else:
         name = known.get("name") or user.first_name or ""
-        await bot.send_message(chat_id=user.id, text=intake.text("done", lang, name=name))
+        await bot.send_message(chat_id=user.id, text=intake.opening(known, lang, name))
 
 
 async def clear_buttons(query):
@@ -588,7 +588,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_step(context.bot, user.id, nxt, lang, user.first_name)
         else:
             name = memory["profile"].get("name") or user.first_name or ""
-            await context.bot.send_message(chat_id=user.id, text=intake.text("done", lang, name=name))
+            await context.bot.send_message(chat_id=user.id, text=intake.opening(memory["profile"], lang, name))
 
     elif parts[0] == "i" and len(parts) == 3:
         step = parts[1]
