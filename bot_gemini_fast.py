@@ -13,15 +13,17 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 from dotenv import load_dotenv
 import google.generativeai as genai
 from flask import Flask, request, Response
 from supabase import create_client, Client
 from telegram import Update
+import intake
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -48,6 +50,7 @@ SUPABASE_URL      = os.getenv("SUPABASE_URL")
 SUPABASE_KEY      = os.getenv("SUPABASE_KEY")
 WEBHOOK_URL       = os.getenv("WEBHOOK_URL")       # Cloud Run service URL
 WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET")    # sent by Telegram in a header; A-Z a-z 0-9 _ - only
+TEAM_CHAT_ID      = os.getenv("TEAM_CHAT_ID")      # optional: Telegram chat that gets data-deletion requests
 PORT              = int(os.getenv("PORT", "8080")) # Cloud Run sets this automatically
 MODEL_NAME        = "gemini-3-flash-preview"
 MAX_HISTORY_TURNS = 10
@@ -61,6 +64,10 @@ SLOW_REPLY_NOTICE = "Still working on it, one moment."
 RECENT_UPDATES_CAP = 1000   # Telegram update ids remembered to drop redeliveries
 WEBHOOK_WAIT_SECONDS = 25   # hold the webhook open this long; Cloud Run only gives CPU during a request
 BOT_NAME         = "gemini"   # discriminator — keeps sessions isolated in shared Supabase
+GENERIC_ERROR    = (
+    "Sorry, I'm having a bit of trouble right now. Please try again in a moment. "
+    "If this keeps happening, contact the Bhavishyath team."
+)
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 _prompt_path = os.path.join(os.path.dirname(__file__), "prompt.txt")
@@ -100,36 +107,88 @@ def init_supabase():
 
 
 # ── Database: User Memory ─────────────────────────────────────────────────────
+# Columns filled by intake (tracker B4). profile_json holds only softer, model-inferred items.
+STRUCTURED_FIELDS = (
+    "name", "class_year", "stream_group", "district", "mandal", "school",
+    "language", "first_generation", "shared_device",
+)
+MEMORY_COLUMNS = "profile_json, summary, consent_at, intake_step, " + ", ".join(STRUCTURED_FIELDS)
+
+
+def _empty_memory(ok: bool = True) -> dict:
+    return {
+        "ok": ok,              # False when the database read failed, so callers don't mistake it for "new student"
+        "profile": {},         # profile_json and the structured columns together, for display and context
+        "profile_json": {},    # the soft items on their own, for merging
+        "fields": {},          # the structured columns on their own
+        "summary": "",
+        "consent_at": None,
+        "intake_step": None,
+    }
+
+
 def get_user_memory(user_id: int) -> dict:
     try:
         res = (
             supabase.table("user_memory")
-            .select("profile_json, summary")
+            .select(MEMORY_COLUMNS)
             .eq("user_id", user_id)
             .maybe_single()
             .execute()
         )
-        if res.data:
-            profile = res.data.get("profile_json") or {}
-            return {"profile": profile, "summary": res.data.get("summary") or ""}
-        return {"profile": {}, "summary": ""}
+        row = res.data if res else None   # maybe_single returns None when there is no row
+        if not row:
+            return _empty_memory()
+        profile_json = row.get("profile_json") or {}
+        fields = {k: row[k] for k in STRUCTURED_FIELDS if row.get(k) is not None}
+        return {
+            "ok": True,
+            "profile": {**profile_json, **fields},
+            "profile_json": profile_json,
+            "fields": fields,
+            "summary": row.get("summary") or "",
+            "consent_at": row.get("consent_at"),
+            "intake_step": row.get("intake_step"),
+        }
     except Exception as e:
         logger.error("get_user_memory error: %s", e)
-        return {"profile": {}, "summary": ""}
+        return _empty_memory(ok=False)
 
 
-def update_user_memory(user_id: int, username: str, first_name: str, profile: dict, summary: str):
+def save_user_fields(user_id: int, fields: dict, username: str = None, first_name: str = None) -> bool:
+    """Create or update a student's row, changing only the columns given."""
+    row = {"user_id": user_id, **fields, "updated_at": datetime.now(timezone.utc).isoformat()}
+    if username is not None:
+        row["username"] = username
+    if first_name is not None:
+        row["first_name"] = first_name
     try:
-        supabase.table("user_memory").upsert({
-            "user_id":      user_id,
-            "username":     username,
-            "first_name":   first_name,
-            "profile_json": profile,
-            "summary":      summary,
-            "updated_at":   datetime.utcnow().isoformat(),
-        }, on_conflict="user_id").execute()
+        supabase.table("user_memory").upsert(row, on_conflict="user_id").execute()
+        return True
     except Exception as e:
-        logger.error("update_user_memory error: %s", e)
+        logger.error("save_user_fields error: %s", e)
+        return False
+
+
+# ── Database: Deletion Requests ───────────────────────────────────────────────
+def create_deletion_request(user_id: int):
+    """Returns "created", "exists" (already pending) or None if the database call failed."""
+    try:
+        pending = (
+            supabase.table("deletion_requests")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if pending.data:
+            return "exists"
+        supabase.table("deletion_requests").insert({"user_id": user_id}).execute()
+        return "created"
+    except Exception as e:
+        logger.error("create_deletion_request error: %s", e)
+        return None
 
 
 # ── Database: Conversation Log (fire-and-forget) ──────────────────────────────
@@ -293,8 +352,7 @@ def setup_gemini():
 gemini_model = None
 
 
-def build_context_message(user_id: int) -> str:
-    memory = get_user_memory(user_id)
+def build_context_message(memory: dict) -> str:
     parts = []
     known = {k: v for k, v in memory["profile"].items() if v not in (None, "", [], {})}
     if known:
@@ -311,14 +369,15 @@ def build_context_message(user_id: int) -> str:
     return "\n".join(parts)
 
 
-async def get_gemini_response(user_id: int, user_message: str) -> str:
+async def get_gemini_response(user_id: int, user_message: str, memory: dict) -> str:
+    """`memory` is the student's get_user_memory() result, already read by the caller."""
     try:
-        # The three reads are independent, so run them at the same time
-        history, context, kb_context = await asyncio.gather(
+        # The two reads are independent, so run them at the same time
+        history, kb_context = await asyncio.gather(
             timed("history", get_session_history, user_id),
-            timed("memory", build_context_message, user_id),
             timed("knowledge_base", get_knowledge_base_context, user_message),
         )
+        context = build_context_message(memory)
 
         # The caller saves the student's message before this runs, so history already
         # ends with it. Drop it here, since send_message sends it as the new turn.
@@ -347,10 +406,7 @@ async def get_gemini_response(user_id: int, user_message: str) -> str:
 
     except Exception as e:
         logger.error("Gemini API error for user %s: %s", user_id, e)
-        return (
-            "Sorry, I'm having a bit of trouble right now. Please try again in a moment. "
-            "If this keeps happening, contact the Bhavishyath team."
-        )
+        return GENERIC_ERROR
 
 # ── Crisis Detection ──────────────────────────────────────────────────────────
 CRISIS_KEYWORDS = [
@@ -409,37 +465,184 @@ async def send_slow_notice(update: Update):
 
 
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
+async def send_consent(bot, chat_id: int):
+    await bot.send_message(chat_id=chat_id, text=intake.consent_text(), reply_markup=intake.consent_keyboard())
+
+
+async def send_step(bot, chat_id: int, step: str, lang: str, first_name: str):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=intake.prompt(step, lang),
+        reply_markup=intake.keyboard(step, lang, first_name),
+    )
+
+
+async def advance_intake(bot, user, memory: dict, step: str, value: str):
+    """Save the answer to `step`, then ask the next question or finish intake."""
+    column = intake.COLUMN[step]
+    known = {**memory["profile"], column: value}
+    nxt = intake.next_step(known)
+    await asyncio.to_thread(save_user_fields, user.id, {column: value, "intake_step": nxt})
+    lang = known.get("language")
+    if nxt:
+        await send_step(bot, user.id, nxt, lang, user.first_name)
+    else:
+        name = known.get("name") or user.first_name or ""
+        await bot.send_message(chat_id=user.id, text=intake.text("done", lang, name=name))
+
+
+async def clear_buttons(query):
+    """Remove the buttons from the message that was tapped, so it can't be tapped twice."""
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception as e:   # e.g. message too old to edit
+        logger.debug("Could not clear buttons: %s", e)
+
+
+async def notify_team(bot, text: str):
+    if not TEAM_CHAT_ID:
+        logger.warning("TEAM_CHAT_ID is not set, so nobody was told about this request")
+        return
+    try:
+        await bot.send_message(chat_id=int(TEAM_CHAT_ID), text=text)
+    except Exception as e:
+        logger.error("Could not notify the team: %s", e)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info("User %s started the bot", user.id)
 
     memory = await asyncio.to_thread(get_user_memory, user.id)
-    is_returning = bool(memory["profile"] or memory["summary"])
+    if not memory["ok"]:
+        await update.message.reply_text(GENERIC_ERROR)
+        return
 
-    if not is_returning:
+    # Nothing is saved until the student agrees, so a new student gets consent first.
+    if not memory["consent_at"]:
+        await send_consent(context.bot, user.id)
+        return
+
+    lang = memory["profile"].get("language")
+    # Mid-intake: pick up at the question they had reached (tracker B6)
+    if memory["intake_step"]:
+        await send_step(context.bot, user.id, memory["intake_step"], lang, user.first_name)
+        return
+
+    name = memory["profile"].get("name") or user.first_name or ""
+    await update.message.reply_text(intake.text("welcome_back", lang, name=name))
+
+
+async def handle_intake_text(update: Update, context: ContextTypes.DEFAULT_TYPE, memory: dict):
+    """The student typed something while a question was waiting for an answer."""
+    user = update.effective_user
+    step = memory["intake_step"]
+    if step in ("name", "district_text"):
+        value = " ".join(update.message.text.split())[: 40 if step == "name" else 60]
+        if value:
+            await advance_intake(context.bot, user, memory, step, value)
+            return
+    # They typed where a button was expected: ask the question again
+    await send_step(context.bot, user.id, step, memory["profile"].get("language"), user.first_name)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Taps on consent, intake and data-deletion buttons (callback data c:/i:/d:)."""
+    query = update.callback_query
+    user = query.from_user
+    await query.answer()
+
+    parts = (query.data or "").split(":")
+    memory = await asyncio.to_thread(get_user_memory, user.id)
+    if not memory["ok"]:
+        await context.bot.send_message(chat_id=user.id, text=GENERIC_ERROR)
+        return
+    lang = memory["profile"].get("language")
+
+    if parts[0] == "c" and len(parts) == 2:
+        await clear_buttons(query)
+        if parts[1] != "1":
+            await context.bot.send_message(chat_id=user.id, text=intake.text("consent_declined", None))
+            return
+        if memory["consent_at"]:
+            return   # tapped twice
+        # Pilot students already have answers in profile_json: carry them into the real columns
+        legacy = {
+            k: memory["profile"][k]
+            for k in ("name", "class_year", "stream_group", "district")
+            if isinstance(memory["profile"].get(k), str) and k not in memory["fields"]
+        }
+        nxt = intake.next_step(memory["profile"])
         await asyncio.to_thread(
-            update_user_memory, user.id, user.username or "", user.first_name, {}, ""
+            save_user_fields, user.id,
+            {
+                "consent_at": datetime.now(timezone.utc).isoformat(),
+                "consent_version": intake.CONSENT_VERSION,
+                "intake_step": nxt,
+                **legacy,
+            },
+            user.username or "", user.first_name,
         )
+        logger.info("User %s gave consent (%s)", user.id, intake.CONSENT_VERSION)
+        if nxt:
+            await send_step(context.bot, user.id, nxt, lang, user.first_name)
+        else:
+            name = memory["profile"].get("name") or user.first_name or ""
+            await context.bot.send_message(chat_id=user.id, text=intake.text("done", lang, name=name))
 
-    if is_returning:
-        name = memory["profile"].get("name", user.first_name)
-        greeting = (
-            f"Welcome back, {name}! 👋\n\n"
-            "I remember our previous conversations. What would you like to explore today — "
-            "career options, entrance exams, colleges, or something else?"
-        )
-    else:
-        greeting = (
-            f"Namaste {user.first_name}! 👋\n\n"
-            "I'm *Bhavishyath*, your career counsellor. I'm here to help you think through "
-            "your education and career options — whether you're in school, intermediate, or degree.\n\n"
-            "To get started, could you tell me:\n"
-            "• Which class/year are you in?\n"
-            "• What stream or group are you studying?\n"
-            "• What are you hoping to explore today?\n\n"
-            "Feel free to write in Telugu or English — both are fine! 😊"
-        )
-    await update.message.reply_text(greeting, parse_mode="Markdown")
+    elif parts[0] == "i" and len(parts) == 3:
+        step = parts[1]
+        # Ignore buttons from an old message, or from before consent
+        if not memory["consent_at"] or memory["intake_step"] != step or step not in intake.COLUMN:
+            return
+        try:
+            idx = int(parts[2])
+        except ValueError:
+            return
+        await clear_buttons(query)
+        if step == "name":
+            value = (user.first_name or "").strip()
+        elif step == "district" and intake.is_other_district(idx):
+            await asyncio.to_thread(save_user_fields, user.id, {"intake_step": "district_text"})
+            await send_step(context.bot, user.id, "district_text", lang, user.first_name)
+            return
+        else:
+            value = intake.choice_value(step, idx)
+        if not value:
+            return
+        await advance_intake(context.bot, user, memory, step, value)
+
+    elif parts[0] == "d" and len(parts) == 2:
+        await clear_buttons(query)
+        if parts[1] != "1":
+            await context.bot.send_message(chat_id=user.id, text=intake.text("delete_cancelled", lang))
+            return
+        result = await asyncio.to_thread(create_deletion_request, user.id)
+        if result is None:
+            await context.bot.send_message(chat_id=user.id, text=GENERIC_ERROR)
+        elif result == "exists":
+            await context.bot.send_message(chat_id=user.id, text=intake.text("delete_already", lang))
+        else:
+            logger.info("User %s asked for their data to be deleted", user.id)
+            await notify_team(
+                context.bot,
+                f"Data deletion request from Telegram user {user.id}. "
+                "It is in the deletion_requests table (status pending).",
+            )
+            await context.bot.send_message(chat_id=user.id, text=intake.text("delete_sent", lang))
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    memory = await asyncio.to_thread(get_user_memory, user.id)
+    if not memory["ok"]:
+        await update.message.reply_text(GENERIC_ERROR)
+        return
+    lang = memory["profile"].get("language")
+    if not (memory["consent_at"] or memory["profile"] or memory["summary"]):
+        await update.message.reply_text(intake.text("delete_nothing", lang))
+        return
+    await update.message.reply_text(intake.text("delete_confirm", lang), reply_markup=intake.delete_keyboard(lang))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -455,7 +658,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — Start or restart the conversation\n"
         "/help — Show this help message\n"
         "/reset — Clear conversation history and start fresh\n"
-        "/profile — View what I remember about you\n\n"
+        "/profile — View what I remember about you\n"
+        "/delete\\_my\\_data — Ask the team to delete everything saved about you\n\n"
         "_You can type in Telugu or English._"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -498,18 +702,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Message from %s (%d chars)", user.id, len(user_message))
 
+    memory = await asyncio.to_thread(get_user_memory, user.id)
+    consented = bool(memory["consent_at"])
+
+    # Safety comes first: a crisis message gets the helpline whether or not the
+    # student has consented. It is only logged if they have.
+    if detect_crisis(user_message):
+        logger.warning("Crisis keywords detected for user %s", user.id)
+        if consented:
+            asyncio.create_task(
+                asyncio.to_thread(log_message_bg, user.id, user.username or "", "user", user_message)
+            )
+            asyncio.create_task(
+                asyncio.to_thread(log_message_bg, user.id, user.username or "", "system", "[CRISIS KEYWORDS DETECTED]")
+            )
+        await update.message.reply_text(CRISIS_RESPONSE, parse_mode="Markdown")
+        return
+
+    # Nothing is saved, logged or sent to the model until the student has consented
+    # and finished intake. A failed read must not look like a new student.
+    if not memory["ok"]:
+        await update.message.reply_text(GENERIC_ERROR)
+        return
+    if not consented:
+        await send_consent(context.bot, user.id)
+        return
+    if memory["intake_step"]:
+        await handle_intake_text(update, context, memory)
+        return
+
     # Fire-and-forget: log incoming message without waiting
     asyncio.create_task(
         asyncio.to_thread(log_message_bg, user.id, user.username or "", "user", user_message)
     )
-
-    if detect_crisis(user_message):
-        logger.warning("Crisis keywords detected for user %s", user.id)
-        asyncio.create_task(
-            asyncio.to_thread(log_message_bg, user.id, user.username or "", "system", "[CRISIS KEYWORDS DETECTED]")
-        )
-        await update.message.reply_text(CRISIS_RESPONSE, parse_mode="Markdown")
-        return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
@@ -518,7 +743,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await timed("save_user", save_to_session_history, user.id, "user", user_message)
     notice = asyncio.create_task(send_slow_notice(update))
     try:
-        bot_response = await get_gemini_response(user.id, user_message)
+        bot_response = await get_gemini_response(user.id, user_message, memory)
     finally:
         notice.cancel()
 
@@ -547,6 +772,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     user = update.effective_user
     logger.info("Voice message from %s", user.id)
+
+    # Same gate as text: no audio is downloaded or sent to the model before consent and intake
+    memory = await asyncio.to_thread(get_user_memory, user.id)
+    if not memory["ok"]:
+        await update.message.reply_text(GENERIC_ERROR)
+        return
+    if not memory["consent_at"]:
+        await send_consent(context.bot, user.id)
+        return
+    if memory["intake_step"]:
+        await send_step(context.bot, user.id, memory["intake_step"], memory["profile"].get("language"), user.first_name)
+        return
+
     t0 = time.perf_counter()
     notice = asyncio.create_task(send_slow_notice(update))
 
@@ -600,7 +838,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await timed("save_user", save_to_session_history, user.id, "user", transcribed_text)
-        bot_response = await get_gemini_response(user.id, transcribed_text)
+        bot_response = await get_gemini_response(user.id, transcribed_text, memory)
         notice.cancel()
 
         try:
@@ -629,6 +867,10 @@ async def update_profile_from_conversation(user_id: int, username: str, first_na
     await asyncio.to_thread(extract_profile_sync, user_id, username, first_name)
 
 
+EXTRACT_FILL_COLUMNS = ("name", "class_year", "stream_group", "district")   # may fill an empty column
+EXTRACT_SOFT_FIELDS  = ("marks_percentage", "career_interests", "concerns")  # kept in profile_json
+
+
 def extract_profile_sync(user_id: int, username: str, first_name: str):
     """Lightweight Gemini call to extract profile facts every few student messages."""
     message_count = count_user_messages(user_id)
@@ -636,6 +878,8 @@ def extract_profile_sync(user_id: int, username: str, first_name: str):
         return
 
     try:
+        if not get_user_memory(user_id)["consent_at"]:
+            return   # no consent, no profile extraction
         history = get_session_history(user_id)
         conversation_text = "\n".join(
             f"{h['role'].upper()}: {h['parts'][0]}" for h in history[-10:]
@@ -656,14 +900,25 @@ If you cannot infer a field, omit it. Return only valid JSON."""
         result = quick_model.generate_content(extraction_prompt)
         raw = result.text.strip().replace("```json", "").replace("```", "").strip()
 
-        new_profile = json.loads(raw)
+        extracted = json.loads(raw)
+        if not isinstance(extracted, dict):
+            raise ValueError("extraction did not return a JSON object")
+
         memory = get_user_memory(user_id)
-        merged = {**memory["profile"], **new_profile}
-        update_user_memory(user_id, username, first_name, merged, memory["summary"])
-        logger.info("Updated profile for user %s (fields: %s)", user_id, ", ".join(sorted(merged)))
+        # Intake answers are never overwritten by a model guess. A guess only fills a
+        # column that is still empty (students from before intake existed).
+        column_updates = {
+            k: v for k, v in extracted.items()
+            if k in EXTRACT_FILL_COLUMNS and isinstance(v, str) and v.strip() and k not in memory["fields"]
+        }
+        soft = {k: v for k, v in extracted.items() if k in EXTRACT_SOFT_FIELDS}
+        merged = {**memory["profile_json"], **soft}
+        save_user_fields(user_id, {"profile_json": merged, **column_updates}, username, first_name)
+        logger.info("Updated profile for user %s (fields: %s)", user_id,
+                    ", ".join(sorted({**merged, **column_updates})))
 
     except Exception as e:
-        logger.debug("Profile extraction skipped: %s", e)
+        logger.warning("Profile extraction failed for user %s: %s", user_id, e)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -755,6 +1010,15 @@ def init_app():
             raise ValueError(f"{name} not set in environment variables")
 
     init_supabase()
+    # Fail at startup, not on the first student message, if the database is not migrated
+    try:
+        supabase.table("user_memory").select(MEMORY_COLUMNS).limit(1).execute()
+        supabase.table("deletion_requests").select("id").limit(1).execute()
+    except Exception as e:
+        raise RuntimeError(
+            "The database is missing the consent/intake columns or the deletion_requests table. "
+            "Run migrations/001_intake_consent.sql in the Supabase SQL editor, then restart."
+        ) from e
     gemini_model = setup_gemini()
 
     ptb_app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -762,6 +1026,8 @@ def init_app():
     ptb_app.add_handler(CommandHandler("help",    help_command))
     ptb_app.add_handler(CommandHandler("reset",   reset_command))
     ptb_app.add_handler(CommandHandler("profile", profile_command))
+    ptb_app.add_handler(CommandHandler("delete_my_data", delete_command))
+    ptb_app.add_handler(CallbackQueryHandler(on_button, pattern=r"^[cid]:"))
     ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     ptb_app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     ptb_app.add_error_handler(error_handler)
@@ -777,7 +1043,11 @@ def init_app():
         await ptb_app.initialize()
         await ptb_app.start()
         webhook_endpoint = f"{WEBHOOK_URL}/webhook"
-        await ptb_app.bot.set_webhook(webhook_endpoint, secret_token=WEBHOOK_SECRET)
+        await ptb_app.bot.set_webhook(
+            webhook_endpoint,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message", "callback_query"],   # buttons arrive as callback_query
+        )
         logger.info("Webhook registered: %s", webhook_endpoint)
 
     asyncio.run_coroutine_threadsafe(setup(), event_loop).result(timeout=30)
